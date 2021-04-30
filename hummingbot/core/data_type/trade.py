@@ -45,8 +45,8 @@ class Trade(namedtuple("_Trade", "trading_pair, side, price, amount, order_type,
                 trade.trading_pair,
                 trade.price,
                 trade.amount,
-                "market" if trade.order_type is OrderType.MARKET else "limit",
-                "buy" if trade.side is TradeType.BUY else "sell",
+                trade.order_type.name.lower(),
+                trade.side.name.lower(),
                 trade.market,
                 datetime.fromtimestamp(trade.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
                 trade.trade_fee.percent,
@@ -54,3 +54,7 @@ class Trade(namedtuple("_Trade", "trading_pair, side, price, amount, order_type,
             ])
 
         return pd.DataFrame(data=data, columns=columns)
+
+    @property
+    def trade_type(self):
+        return self.side.name

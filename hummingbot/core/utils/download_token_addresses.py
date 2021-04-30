@@ -14,29 +14,10 @@ from typing import (
 from web3 import Web3
 from hummingbot.core.utils.async_utils import safe_gather
 
-DDEX_ENDPOINT = "https://api.ddex.io/v3/markets"
 RADAR_RELAY_ENDPOINT = "https://api.radarrelay.com/v2/markets"
 BAMBOO_RELAY_ENDPOINT = "https://rest.bamboorelay.com/main/0x/markets"
 DOLOMITE_ENDPOINT = "https://exchange-api.dolomite.io/v1/tokens"
 API_CALL_TIMEOUT = 5
-
-
-async def download_ddex_token_addresses(token_dict: Dict[str, str]):
-    async with aiohttp.ClientSession() as client:
-        async with client.get(DDEX_ENDPOINT, timeout=API_CALL_TIMEOUT) as response:
-            if response.status == 200:
-                try:
-                    response = await response.json()
-                    markets = response.get("data").get("markets")
-                    for market in markets:
-                        base = market.get("baseToken")
-                        quote = market.get("quoteToken")
-                        if base not in token_dict:
-                            token_dict[base] = Web3.toChecksumAddress(market.get("baseTokenAddress"))
-                        if quote not in token_dict:
-                            token_dict[quote] = Web3.toChecksumAddress(market.get("quoteTokenAddress"))
-                except Exception as err:
-                    logging.getLogger().error(err)
 
 
 async def download_dolomite_token_addresses(token_dict: Dict[str, str]):
@@ -112,14 +93,13 @@ async def download_bamboo_relay_token_addresses(token_dict: Dict[str, str]):
 def download_erc20_token_addresses():
     try:
         TOKEN_ADDRESS_PATH = "../../wallet/ethereum/erc20_tokens.json"
-        logging.getLogger().info(f"Downloading ERC20 token addresses...")
+        logging.getLogger().info("Downloading ERC20 token addresses...")
 
         with open(os.path.join(os.path.dirname(__file__), TOKEN_ADDRESS_PATH)) as old_erc20:
             td = json.load(old_erc20)
             old_len = len(td.keys())
             asyncio.get_event_loop().run_until_complete(safe_gather(
                 download_radar_relay_token_addresses(td),
-                download_ddex_token_addresses(td),
                 download_bamboo_relay_token_addresses(td),
                 download_dolomite_token_addresses(td),
             ))

@@ -1,27 +1,27 @@
 #!/usr/bin/env python
 
 from os.path import join, realpath
-import sys
-from hummingbot.market.kucoin.kucoin_user_stream_tracker import KucoinUserStreamTracker
-from hummingbot.market.kucoin.kucoin_auth import KucoinAuth
+import sys; sys.path.insert(0, realpath(join(__file__, "../../../")))
+
+from hummingbot.connector.exchange.kucoin.kucoin_user_stream_tracker import KucoinUserStreamTracker
+from hummingbot.connector.exchange.kucoin.kucoin_auth import KucoinAuth
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
 
-from hummingbot.market.kucoin.kucoin_order_book_tracker import KucoinOrderBookTracker
+from hummingbot.connector.exchange.kucoin.kucoin_order_book_tracker import KucoinOrderBookTracker
 import asyncio
 import logging
 import conf
 from typing import Optional
 import unittest
 
-sys.path.insert(0, realpath(join(__file__, "../../../")))
-
-
 # logging.basicConfig(level=logging.DEBUG)
 
 
 class KucoinOrderBookTrackerUnitTest(unittest.TestCase):
+
     order_book_tracker: Optional[KucoinOrderBookTracker] = None
+
     @classmethod
     def setUpClass(cls):
         cls.ev_loop: asyncio.BaseEventLoop = asyncio.get_event_loop()

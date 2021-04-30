@@ -1,14 +1,17 @@
 import logging
 from decimal import Decimal
-
+from functools import lru_cache
 import ruamel.yaml
-from os import unlink
+from os import (
+    unlink
+)
 from os.path import (
     join,
-    isfile,
+    isfile
 )
 from collections import OrderedDict
 import json
+import requests
 from typing import (
     Any,
     Callable,
@@ -21,22 +24,21 @@ import shutil
 
 from hummingbot.client.config.config_var import ConfigVar
 from hummingbot.client.config.global_config_map import global_config_map
-from hummingbot.client.liquidity_bounty.liquidity_bounty_config_map import liquidity_bounty_config_map
+from hummingbot.client.config.fee_overrides_config_map import fee_overrides_config_map
 from hummingbot.client.settings import (
     GLOBAL_CONFIG_PATH,
+    TRADE_FEES_CONFIG_PATH,
     TEMPLATE_PATH,
     CONF_FILE_PATH,
     CONF_POSTFIX,
     CONF_PREFIX,
-    LIQUIDITY_BOUNTY_CONFIG_PATH,
     TOKEN_ADDRESSES_FILE_PATH,
+    CONNECTOR_SETTINGS
 )
-from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.client.config.config_crypt import (
-    encrypt_n_save_config_value,
-    decrypt_config_value,
-    encrypted_config_file_exists
-)
+from hummingbot.client.config.security import Security
+from hummingbot.core.utils.market_price import get_last_price
+from hummingbot import get_strategy_list
+from eth_account import Account
 
 # Use ruamel.yaml to preserve order and comments in .yml file
 yaml_parser = ruamel.yaml.YAML()
@@ -65,36 +67,68 @@ def parse_cvar_value(cvar: ConfigVar, value: Any) -> Any:
     elif cvar.type == 'json':
         if isinstance(value, str):
             value_json = value.replace("'", '"')  # replace single quotes with double quotes for valid JSON
-            return json.loads(value_json)
+            cvar_value = json.loads(value_json)
         else:
-            return value
+            cvar_value = value
+        return cvar_json_migration(cvar, cvar_value)
     elif cvar.type == 'float':
         try:
             return float(value)
         except Exception:
-            logging.getLogger().error(f"\"{value}\" is not an integer.", exc_info=True)
-            return 0.0
+            logging.getLogger().error(f"\"{value}\" is not valid float.", exc_info=True)
+            return value
     elif cvar.type == 'decimal':
         try:
             return Decimal(str(value))
         except Exception:
             logging.getLogger().error(f"\"{value}\" is not valid decimal.", exc_info=True)
-            return Decimal(0)
+            return value
     elif cvar.type == 'int':
         try:
             return int(value)
         except Exception:
             logging.getLogger().error(f"\"{value}\" is not an integer.", exc_info=True)
-            return 0
+            return value
     elif cvar.type == 'bool':
         if isinstance(value, str) and value.lower() in ["true", "yes", "y"]:
             return True
         elif isinstance(value, str) and value.lower() in ["false", "no", "n"]:
             return False
         else:
-            return bool(value)
+            return value
     else:
         raise TypeError
+
+
+def cvar_json_migration(cvar: ConfigVar, cvar_value: Any) -> Any:
+    """
+    A special function to migrate json config variable when its json type changes, for paper_trade_account_balance
+    and min_quote_order_amount, they were List but change to Dict.
+    """
+    if cvar.key in ("paper_trade_account_balance", "min_quote_order_amount") and isinstance(cvar_value, List):
+        results = {}
+        for item in cvar_value:
+            results[item[0]] = item[1]
+        return results
+    return cvar_value
+
+
+def parse_cvar_default_value_prompt(cvar: ConfigVar) -> str:
+    """
+    :param cvar: ConfigVar object
+    :return: text for default value prompt
+    """
+    if cvar.default is None:
+        default = ""
+    elif callable(cvar.default):
+        default = cvar.default()
+    elif cvar.type == 'bool' and isinstance(cvar.prompt, str) and "Yes/No" in cvar.prompt:
+        default = "Yes" if cvar.default else "No"
+    else:
+        default = str(cvar.default)
+    if isinstance(default, Decimal):
+        default = "{0:.4f}".format(default)
+    return default
 
 
 async def copy_strategy_template(strategy: str) -> str:
@@ -122,18 +156,41 @@ def get_strategy_template_path(strategy: str) -> str:
     return join(TEMPLATE_PATH, f"{CONF_PREFIX}{strategy}{CONF_POSTFIX}_TEMPLATE.yml")
 
 
-def get_erc20_token_addresses(trading_pairs: List[str]):
+def get_eth_wallet_private_key() -> Optional[str]:
+    ethereum_wallet = global_config_map.get("ethereum_wallet").value
+    if ethereum_wallet is None or ethereum_wallet == "":
+        return None
+    private_key = Security._private_keys[ethereum_wallet]
+    account = Account.privateKeyToAccount(private_key)
+    return account.privateKey.hex()
 
-    with open(TOKEN_ADDRESSES_FILE_PATH) as f:
-        try:
-            data: Dict[str, str] = json.load(f)
-            overrides: Dict[str, str] = global_config_map.get("ethereum_token_overrides").value
-            if overrides is not None:
-                data.update(overrides)
-            addresses = [data[trading_pair] for trading_pair in trading_pairs if trading_pair in data]
-            return addresses
-        except Exception as e:
-            logging.getLogger().error(e, exc_info=True)
+
+@lru_cache(None)
+def get_erc20_token_addresses() -> Dict[str, List]:
+    token_list_url = global_config_map.get("ethereum_token_list_url").value
+    address_file_path = TOKEN_ADDRESSES_FILE_PATH
+    token_list = {}
+
+    resp = requests.get(token_list_url, timeout=1)
+    decoded_resp = resp.json()
+
+    for token in decoded_resp["tokens"]:
+        token_list[token["symbol"]] = [token["address"], token["decimals"]]
+
+    try:
+        with open(address_file_path) as f:
+            overrides: Dict[str, str] = json.load(f)
+            for token, address in overrides.items():
+                override_token = token_list.get(token, [address, 18])
+                token_list[token] = [address, override_token[1]]
+    except FileNotFoundError:
+        # create override file for first run w docker
+        with open(address_file_path, "w+") as f:
+            f.write(json.dumps({}))
+    except Exception as e:
+        logging.getLogger().error(e, exc_info=True)
+
+    return token_list
 
 
 def _merge_dicts(*args: Dict[str, ConfigVar]) -> OrderedDict:
@@ -146,12 +203,17 @@ def _merge_dicts(*args: Dict[str, ConfigVar]) -> OrderedDict:
     return result
 
 
+def get_connector_class(connector_name: str) -> Callable:
+    conn_setting = CONNECTOR_SETTINGS[connector_name]
+    mod = __import__(conn_setting.module_path(),
+                     fromlist=[conn_setting.class_name()])
+    return getattr(mod, conn_setting.class_name())
+
+
 def get_strategy_config_map(strategy: str) -> Optional[Dict[str, ConfigVar]]:
     """
     Given the name of a strategy, find and load strategy-specific config map.
     """
-    if strategy is None:
-        return None
     try:
         cm_key = f"{strategy}_config_map"
         strategy_module = __import__(f"hummingbot.strategy.{strategy}.{cm_key}",
@@ -176,85 +238,108 @@ def get_strategy_starter_file(strategy: str) -> Callable:
         logging.getLogger().error(e, exc_info=True)
 
 
-def load_required_configs(*args) -> OrderedDict:
-    """
-    Go through `in_memory_config_map`, `strategy_config_map`, and `global_config_map` in order to list all of the
-    config settings required by the bot.
-    """
-    from hummingbot.client.config.in_memory_config_map import in_memory_config_map
-    current_strategy = in_memory_config_map.get("strategy").value
-    current_strategy_file_path = in_memory_config_map.get("strategy_file_path").value
-    if current_strategy is None or current_strategy_file_path is None:
-        return _merge_dicts(in_memory_config_map)
-    else:
-        strategy_config_map = get_strategy_config_map(current_strategy)
-        # create an ordered dict where `strategy` is inserted first
-        # so that strategy-specific configs are prompted first and populate required_exchanges
-        return _merge_dicts(in_memory_config_map, strategy_config_map, global_config_map)
+def load_required_configs(strategy_name) -> OrderedDict:
+    strategy_config_map = get_strategy_config_map(strategy_name)
+    # create an ordered dict where `strategy` is inserted first
+    # so that strategy-specific configs are prompted first and populate required_exchanges
+    return _merge_dicts(strategy_config_map, global_config_map)
 
 
-def read_configs_from_yml(strategy_file_path: Optional[str] = None):
-    """
-    Read global config and selected strategy yml files and save the values to corresponding config map
-    If a yml file is outdated, it gets reformatted with the new template
-    """
-    from hummingbot.client.config.in_memory_config_map import in_memory_config_map
-    current_strategy = in_memory_config_map.get("strategy").value
-    strategy_config_map: Optional[Dict[str, ConfigVar]] = get_strategy_config_map(current_strategy)
+def strategy_name_from_file(file_path: str) -> str:
+    with open(file_path) as stream:
+        data = yaml_parser.load(stream) or {}
+        strategy = data.get("strategy")
+    return strategy
 
-    def load_yml_into_cm(yml_path: str, template_file_path: str, cm: Dict[str, ConfigVar]):
-        try:
-            with open(yml_path) as stream:
-                data = yaml_parser.load(stream) or {}
-                conf_version = data.get("template_version", 0)
 
-            with open(template_file_path, "r") as template_fd:
-                template_data = yaml_parser.load(template_fd)
-                template_version = template_data.get("template_version", 0)
+def validate_strategy_file(file_path: str) -> Optional[str]:
+    if not isfile(file_path):
+        return f"{file_path} file does not exist."
+    strategy = strategy_name_from_file(file_path)
+    if strategy is None:
+        return "Invalid configuration file or 'strategy' field is missing."
+    if strategy not in get_strategy_list():
+        return "Invalid strategy specified in the file."
+    return None
 
-            for key in template_data:
-                if key in {"wallet", "template_version"}:
-                    continue
 
-                cvar = cm.get(key)
-                if cvar is None:
-                    logging.getLogger().error(f"Cannot find corresponding config to key {key} in template.")
-                    continue
+async def update_strategy_config_map_from_file(yml_path: str) -> str:
+    strategy = strategy_name_from_file(yml_path)
+    config_map = get_strategy_config_map(strategy)
+    template_path = get_strategy_template_path(strategy)
+    await load_yml_into_cm(yml_path, template_path, config_map)
+    return strategy
 
-                val_in_file = data.get(key)
-                cvar.value = parse_cvar_value(cvar, val_in_file)
-                if cvar.is_secure:
-                    if encrypted_config_file_exists(cvar):
-                        password = in_memory_config_map.get("password").value
-                        if password is not None:
-                            cvar.value = decrypt_config_value(cvar, password)
-                if val_in_file is not None and not cvar.validate(cvar.value):
+
+async def load_yml_into_cm(yml_path: str, template_file_path: str, cm: Dict[str, ConfigVar]):
+    try:
+        with open(yml_path) as stream:
+            data = yaml_parser.load(stream) or {}
+            conf_version = data.get("template_version", 0)
+
+        with open(template_file_path, "r") as template_fd:
+            template_data = yaml_parser.load(template_fd)
+            template_version = template_data.get("template_version", 0)
+
+        for key in template_data:
+            if key in {"template_version"}:
+                continue
+
+            cvar = cm.get(key)
+            if cvar is None:
+                logging.getLogger().error(f"Cannot find corresponding config to key {key} in template.")
+                continue
+
+            # Skip this step since the values are not saved in the yml file
+            if cvar.is_secure:
+                cvar.value = Security.decrypted_value(key)
+                continue
+
+            val_in_file = data.get(key)
+            if (val_in_file is None or val_in_file == "") and cvar.default is not None:
+                cvar.value = cvar.default
+                continue
+
+            # Todo: the proper process should be first validate the value then assign it
+            cvar.value = parse_cvar_value(cvar, val_in_file)
+            if cvar.value is not None:
+                err_msg = await cvar.validate(str(cvar.value))
+                if err_msg is not None:
                     # Instead of raising an exception, simply skip over this variable and wait till the user is prompted
                     logging.getLogger().error("Invalid value %s for config variable %s" % (val_in_file, cvar.key))
                     cvar.value = None
 
-            if conf_version < template_version:
-                # delete old config file
-                if isfile(yml_path):
-                    unlink(yml_path)
-                # copy the new file template
-                shutil.copy(template_file_path, yml_path)
-                # save the old variables into the new config file
-                safe_ensure_future(save_to_yml(yml_path, cm))
-        except Exception as e:
-            logging.getLogger().error("Error loading configs. Your config file may be corrupt. %s" % (e,),
-                                      exc_info=True)
-
-    load_yml_into_cm(GLOBAL_CONFIG_PATH, join(TEMPLATE_PATH, "conf_global_TEMPLATE.yml"), global_config_map)
-    load_yml_into_cm(LIQUIDITY_BOUNTY_CONFIG_PATH,
-                     join(TEMPLATE_PATH, "conf_liquidity_bounty_TEMPLATE.yml"),
-                     liquidity_bounty_config_map)
-    if strategy_file_path:
-        strategy_template_path = get_strategy_template_path(current_strategy)
-        load_yml_into_cm(join(CONF_FILE_PATH, strategy_file_path), strategy_template_path, strategy_config_map)
+        if conf_version < template_version:
+            # delete old config file
+            if isfile(yml_path):
+                unlink(yml_path)
+            # copy the new file template
+            shutil.copy(template_file_path, yml_path)
+            # save the old variables into the new config file
+            save_to_yml(yml_path, cm)
+    except Exception as e:
+        logging.getLogger().error("Error loading configs. Your config file may be corrupt. %s" % (e,),
+                                  exc_info=True)
 
 
-async def save_to_yml(yml_path: str, cm: Dict[str, ConfigVar]):
+async def read_system_configs_from_yml():
+    """
+    Read global config and selected strategy yml files and save the values to corresponding config map
+    If a yml file is outdated, it gets reformatted with the new template
+    """
+    await load_yml_into_cm(GLOBAL_CONFIG_PATH, join(TEMPLATE_PATH, "conf_global_TEMPLATE.yml"), global_config_map)
+    await load_yml_into_cm(TRADE_FEES_CONFIG_PATH, join(TEMPLATE_PATH, "conf_fee_overrides_TEMPLATE.yml"),
+                           fee_overrides_config_map)
+    # In case config maps get updated (due to default values)
+    save_system_configs_to_yml()
+
+
+def save_system_configs_to_yml():
+    save_to_yml(GLOBAL_CONFIG_PATH, global_config_map)
+    save_to_yml(TRADE_FEES_CONFIG_PATH, fee_overrides_config_map)
+
+
+def save_to_yml(yml_path: str, cm: Dict[str, ConfigVar]):
     """
     Write current config saved a single config map into each a single yml file
     """
@@ -264,10 +349,7 @@ async def save_to_yml(yml_path: str, cm: Dict[str, ConfigVar]):
             for key in cm:
                 cvar = cm.get(key)
                 if cvar.is_secure:
-                    if cvar.value is not None and not encrypted_config_file_exists(cvar):
-                        from hummingbot.client.config.in_memory_config_map import in_memory_config_map
-                        password = in_memory_config_map.get("password").value
-                        encrypt_n_save_config_value(cvar, password)
+                    Security.update_secure_config(key, cvar.value)
                     if key in data:
                         data.pop(key)
                 elif type(cvar.value) == Decimal:
@@ -280,20 +362,11 @@ async def save_to_yml(yml_path: str, cm: Dict[str, ConfigVar]):
         logging.getLogger().error("Error writing configs: %s" % (str(e),), exc_info=True)
 
 
-async def write_config_to_yml():
-    """
-    Write current config saved in all config maps into each corresponding yml file
-    """
-    from hummingbot.client.config.in_memory_config_map import in_memory_config_map
-    current_strategy = in_memory_config_map.get("strategy").value
-    strategy_file_path = in_memory_config_map.get("strategy_file_path").value
-
-    if current_strategy is not None and strategy_file_path is not None:
-        strategy_config_map = get_strategy_config_map(current_strategy)
-        strategy_file_path = join(CONF_FILE_PATH, strategy_file_path)
-        await save_to_yml(strategy_file_path, strategy_config_map)
-
-    await save_to_yml(GLOBAL_CONFIG_PATH, global_config_map)
+async def write_config_to_yml(strategy_name, strategy_file_name):
+    strategy_config_map = get_strategy_config_map(strategy_name)
+    strategy_file_path = join(CONF_FILE_PATH, strategy_file_name)
+    save_to_yml(strategy_file_path, strategy_config_map)
+    save_to_yml(GLOBAL_CONFIG_PATH, global_config_map)
 
 
 async def create_yml_files():
@@ -322,3 +395,110 @@ async def create_yml_files():
                         pass
                 if conf_version < template_version:
                     shutil.copy(template_path, conf_path)
+
+
+def default_min_quote(quote_asset: str) -> (str, Decimal):
+    result_quote, result_amount = "USD", Decimal("11")
+    min_quote_config = global_config_map["min_quote_order_amount"].value
+    if min_quote_config is not None and quote_asset in min_quote_config:
+        result_quote, result_amount = quote_asset, Decimal(str(min_quote_config[quote_asset]))
+    return result_quote, result_amount
+
+
+async def minimum_order_amount(exchange: str, trading_pair: str) -> Decimal:
+    base_asset, quote_asset = trading_pair.split("-")
+    default_quote_asset, default_amount = default_min_quote(quote_asset)
+    quote_amount = Decimal("0")
+    if default_quote_asset == quote_asset:
+        mid_price = await get_last_price(exchange, trading_pair)
+        if mid_price is not None:
+            quote_amount = default_amount / mid_price
+    return round(quote_amount, 4)
+
+
+def default_strategy_file_path(strategy: str) -> str:
+    """
+    Find the next available file name.
+    :return: a default file name - `conf_{short_strategy}_{INDEX}.yml` e.g. 'conf_pure_mm_1.yml'
+    """
+    i = 1
+    new_fname = f"{CONF_PREFIX}{short_strategy_name(strategy)}_{i}.yml"
+    new_path = join(CONF_FILE_PATH, new_fname)
+    while isfile(new_path):
+        new_fname = f"{CONF_PREFIX}{short_strategy_name(strategy)}_{i}.yml"
+        new_path = join(CONF_FILE_PATH, new_fname)
+        i += 1
+    return new_fname
+
+
+def short_strategy_name(strategy: str) -> str:
+    if strategy == "pure_market_making":
+        return "pure_mm"
+    elif strategy == "cross_exchange_market_making":
+        return "xemm"
+    elif strategy == "arbitrage":
+        return "arb"
+    else:
+        return strategy
+
+
+def all_configs_complete(strategy):
+    strategy_map = get_strategy_config_map(strategy)
+    return config_map_complete(global_config_map) and config_map_complete(strategy_map)
+
+
+def config_map_complete(config_map):
+    return not any(c.required and c.value is None for c in config_map.values())
+
+
+def missing_required_configs(config_map):
+    return [c for c in config_map.values() if c.required and c.value is None and not c.is_connect_key]
+
+
+def load_all_secure_values(strategy):
+    strategy_map = get_strategy_config_map(strategy)
+    load_secure_values(global_config_map)
+    load_secure_values(strategy_map)
+
+
+def load_secure_values(config_map):
+    for key, config in config_map.items():
+        if config.is_secure:
+            config.value = Security.decrypted_value(key)
+
+
+def format_config_file_name(file_name):
+    if "." not in file_name:
+        return file_name + ".yml"
+    return file_name
+
+
+def parse_config_default_to_text(config: ConfigVar) -> str:
+    """
+    :param config: ConfigVar object
+    :return: text for default value prompt
+    """
+    if config.default is None:
+        default = ""
+    elif callable(config.default):
+        default = config.default()
+    elif config.type == 'bool' and isinstance(config.prompt, str) and "Yes/No" in config.prompt:
+        default = "Yes" if config.default else "No"
+    else:
+        default = str(config.default)
+    if isinstance(default, Decimal):
+        default = "{0:.4f}".format(default)
+    return default
+
+
+def secondary_market_conversion_rate(strategy) -> Decimal:
+    config_map = get_strategy_config_map(strategy)
+    if "secondary_to_primary_quote_conversion_rate" in config_map:
+        base_rate = config_map["secondary_to_primary_base_conversion_rate"].value
+        quote_rate = config_map["secondary_to_primary_quote_conversion_rate"].value
+    elif "taker_to_maker_quote_conversion_rate" in config_map:
+        base_rate = config_map["taker_to_maker_base_conversion_rate"].value
+        quote_rate = config_map["taker_to_maker_quote_conversion_rate"].value
+    else:
+        return Decimal("1")
+    return quote_rate / base_rate

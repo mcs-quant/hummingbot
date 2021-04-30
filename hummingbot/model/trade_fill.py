@@ -5,7 +5,8 @@ from typing import (
     Any,
     Dict,
     List,
-    Optional)
+    Optional,
+)
 from sqlalchemy import (
     Column,
     ForeignKey,
@@ -50,16 +51,18 @@ class TradeFill(HummingbotBase):
     order_type = Column(Text, nullable=False)
     price = Column(Float, nullable=False)
     amount = Column(Float, nullable=False)
+    leverage = Column(Integer, nullable=False, default=1)
     trade_fee = Column(JSON, nullable=False)
     exchange_trade_id = Column(Text, nullable=False)
+    position = Column(Text, nullable=True)
     order = relationship("Order", back_populates="trade_fills")
 
     def __repr__(self) -> str:
         return f"TradeFill(id={self.id}, config_file_path='{self.config_file_path}', strategy='{self.strategy}', " \
             f"market='{self.market}', symbol='{self.symbol}', base_asset='{self.base_asset}', " \
             f"quote_asset='{self.quote_asset}', timestamp={self.timestamp}, order_id='{self.order_id}', " \
-            f"trade_type='{self.trade_type}', order_type='{self.order_type}', price={self.price}, " \
-            f"amount={self.amount}, trade_fee={self.trade_fee}, exchange_trade_id={self.exchange_trade_id})"
+            f"trade_type='{self.trade_type}', order_type='{self.order_type}', price={self.price}, amount={self.amount}, " \
+            f"leverage={self.leverage}, trade_fee={self.trade_fee}, exchange_trade_id={self.exchange_trade_id}, position={self.position})"
 
     @staticmethod
     def get_trades(sql_session: Session,
@@ -102,37 +105,52 @@ class TradeFill(HummingbotBase):
 
     @classmethod
     def to_pandas(cls, trades: List):
-        columns: List[str] = ["symbol",
-                              "price",
-                              "amount",
-                              "order_type",
-                              "side",
-                              "market",
-                              "timestamp",
-                              "fee_percent",
-                              "flat_fee / gas"]
+        columns: List[str] = ["Index",
+                              "Timestamp",
+                              "Exchange",
+                              "Market",
+                              "Order_type",
+                              "Side",
+                              "Price",
+                              "Amount",
+                              "Leverage",
+                              "Position",
+                              "Age"]
         data = []
+        index = 0
         for trade in trades:
+            """
+            Comment out fees
             flat_fees: List[Dict[str, Any]] = trade.trade_fee["flat_fees"]
             if len(flat_fees) == 0:
                 flat_fee_str = "None"
             else:
-                fee_strs = [f"{fee_dict['amount']} {fee_dict['trading_pair']}" for fee_dict in flat_fees]
+                fee_strs = [f"{fee_dict['amount']} {fee_dict['asset']}" for fee_dict in flat_fees]
                 flat_fee_str = ",".join(fee_strs)
+            """
 
+            index += 1
+            # // indicates order is a paper order so 'n/a'. For real orders, calculate age.
+            age = "n/a"
+            if "//" not in trade.order_id:
+                age = pd.Timestamp(int(trade.timestamp / 1e3 - int(trade.order_id[-16:]) / 1e6), unit='s').strftime('%H:%M:%S')
             data.append([
+                index,
+                datetime.fromtimestamp(int(trade.timestamp / 1e3)).strftime("%Y-%m-%d %H:%M:%S"),
+                trade.market,
                 trade.symbol,
-                trade.price,
-                trade.amount,
                 trade.order_type.lower(),
                 trade.trade_type.lower(),
-                trade.market,
-                datetime.fromtimestamp(int(trade.timestamp / 1e3)).strftime("%Y-%m-%d %H:%M:%S"),
-                trade.trade_fee['percent'],
-                flat_fee_str,
+                trade.price,
+                trade.amount,
+                trade.leverage,
+                trade.position,
+                age,
             ])
+        df = pd.DataFrame(data=data, columns=columns)
+        df.set_index('Index', inplace=True)
 
-        return pd.DataFrame(data=data, columns=columns)
+        return df
 
     @staticmethod
     def to_bounty_api_json(trade_fill: "TradeFill") -> Dict[str, Any]:

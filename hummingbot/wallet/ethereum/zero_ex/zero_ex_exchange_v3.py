@@ -18,6 +18,7 @@ with open(os.path.join(os.path.dirname(__file__), "zero_ex_exchange_abi_v3.json"
 # 150,000 per order by gas
 PROTOCOL_FEE_MULTIPLIER = 150000
 
+
 class ZeroExExchange:
     def __init__(self,
                  w3: Web3,
@@ -86,7 +87,7 @@ class ZeroExExchange:
         gas_price: int = self._wallet.gas_price + 10
         protocol_fee = PROTOCOL_FEE_MULTIPLIER * len(orders) * gas_price
         tx_hash: str = self._wallet.execute_transaction(
-            self._contract.functions.marketBuyOrders(
+            self._contract.functions.marketBuyOrdersFillOrKill(
                 order_tuples,
                 int(maker_asset_fill_amount),
                 signatures
@@ -103,7 +104,7 @@ class ZeroExExchange:
         gas_price: int = self._wallet.gas_price + 10
         protocol_fee = PROTOCOL_FEE_MULTIPLIER * len(orders) * gas_price
         tx_hash: str = self._wallet.execute_transaction(
-            self._contract.functions.marketSellOrders(
+            self._contract.functions.marketSellOrdersFillOrKill(
                 order_tuples,
                 int(taker_asset_fill_amount),
                 signatures
